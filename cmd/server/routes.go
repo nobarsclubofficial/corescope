@@ -70,6 +70,18 @@ type Server struct {
 	scopeStatsCache    map[string]*ScopeStatsResponse
 	scopeStatsCachedAt map[string]time.Time
 
+	// #1975: cached /api/scope-audit response, per window, recomputed at most
+	// once every 30s. Mirrors the scopeStats cache directly above it.
+	scopeAuditMu       sync.Mutex
+	scopeAuditCache    map[string]*ScopeAuditResponse
+	scopeAuditCachedAt map[string]time.Time
+	scopeAuditSF       singleflight.Group
+
+	// #1975: /api/scope-audit window cache and its single-flight guard, so a
+	// burst of viewers on a cold cache recomputes the network-wide scan once
+	// rather than once per request. Lives in scope_audit.go.
+	scopes scopesState
+
 	// Router reference for OpenAPI spec generation
 	router *mux.Router
 
@@ -235,6 +247,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/health", s.handleHealth).Methods("GET")
 	r.HandleFunc("/api/stats", s.handleStats).Methods("GET")
 	r.HandleFunc("/api/scope-stats", s.handleScopeStats).Methods("GET")
+	r.HandleFunc("/api/scope-audit", s.handleScopeAudit).Methods("GET") // #1975
 	r.HandleFunc("/api/perf", s.handlePerf).Methods("GET")
 	r.HandleFunc("/api/perf/io", s.handlePerfIO).Methods("GET")
 	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
@@ -685,8 +698,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startedAt).Seconds()
 
 	wsClients := 0
+	var wsDeny, wsRate, wsConnCap int64
 	if s.hub != nil {
 		wsClients = s.hub.ClientCount()
+		wsDeny, wsRate, wsConnCap = s.hub.limits.counts() // #1794; nil-safe
 	}
 
 	// Real packet store stats
@@ -758,8 +773,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			P95Ms:        round(percentile(sortedPauses, 0.95), 1),
 			P99Ms:        round(percentile(sortedPauses, 0.99), 1),
 		},
-		Cache:     cs,
-		WebSocket: WebSocketStatsResp{Clients: wsClients},
+		Cache: cs,
+		WebSocket: WebSocketStatsResp{Clients: wsClients,
+			RejectedDeny: wsDeny, RejectedRate: wsRate, RejectedConnCap: wsConnCap},
 		PacketStore: HealthPacketStoreStats{
 			Packets:     pktCount,
 			EstimatedMB: pktEstMB,
